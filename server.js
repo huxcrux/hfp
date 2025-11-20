@@ -32,11 +32,17 @@ const logVisit = ({
 };
 
 app.use((req, _res, next) => {
+  const isLikelyBrowserNavigation =
+    req.get('sec-fetch-mode') === 'navigate' ||
+    req.get('sec-fetch-dest') === 'document';
+
   if (
     req.method === 'GET' &&
     !req.path.startsWith('/api') &&
-    !path.extname(req.path)
+    !path.extname(req.path) &&
+    !isLikelyBrowserNavigation
   ) {
+    // Avoid double-logging: browsers will send metrics via /api/visit after navigation.
     logVisit({
       req,
       note: 'initial-request-no-client-metrics',
