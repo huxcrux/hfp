@@ -587,17 +587,22 @@ const detectFonts = async () => {
   return detected;
 };
 
+const CHALLENGE_TIMEOUT_MS = 5000; // 5 second timeout for JS challenge
+
 export default function App() {
   const [browserData, setBrowserData] = useState(null);
   const [botAnalysis, setBotAnalysis] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [analysisStatus, setAnalysisStatus] = useState('collecting'); // 'collecting' | 'challenging' | 'analyzing' | 'complete'
   const hasReported = useRef(false);
+  const analysisComplete = useRef(false);
 
   useEffect(() => {
     const collect = async () => {
       const data = await collectBrowserData();
       setBrowserData(data);
       setLoading(false);
+      setAnalysisStatus('challenging');
     };
     collect();
   }, []);
@@ -643,30 +648,59 @@ export default function App() {
       }
     };
 
-    // Run challenge and bot analysis in parallel
-    Promise.all([
-      solveChallenge(),
-      Promise.resolve(browserData),
-    ]).then(([challengeResult, data]) => {
-      // Include challenge result in browser data
-      const dataWithChallenge = {
-        ...data,
-        jsChallenge: challengeResult,
-      };
+    // Submit bot analysis with the given data
+    const submitAnalysis = async (dataWithChallenge) => {
+      if (analysisComplete.current) return; // Already submitted
+      analysisComplete.current = true;
 
-      // Always run bot analysis (works in dev mode too)
-      return fetch('/api/bot', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(dataWithChallenge),
-      });
-    })
-      .then((res) => res.json())
-      .then((analysis) => setBotAnalysis(analysis))
-      .catch((error) => {
+      setAnalysisStatus('analyzing');
+
+      try {
+        const res = await fetch('/api/bot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(dataWithChallenge),
+        });
+        const analysis = await res.json();
+        setBotAnalysis(analysis);
+        setAnalysisStatus('complete');
+      } catch (error) {
         console.warn('Failed to get bot analysis', error);
+        setAnalysisStatus('complete');
+      }
+    };
+
+    // Set up timeout - if challenge doesn't complete in 5 seconds, submit as bot
+    const timeoutId = setTimeout(() => {
+      if (analysisComplete.current) return;
+
+      console.warn('JS challenge timed out after 5 seconds');
+      submitAnalysis({
+        ...browserData,
+        jsChallenge: { valid: false, error: 'Challenge timed out after 5 seconds' },
+      });
+    }, CHALLENGE_TIMEOUT_MS);
+
+    // Run challenge and submit analysis
+    solveChallenge()
+      .then((challengeResult) => {
+        clearTimeout(timeoutId);
+        if (analysisComplete.current) return;
+
+        submitAnalysis({
+          ...browserData,
+          jsChallenge: challengeResult,
+        });
+      })
+      .catch((error) => {
+        clearTimeout(timeoutId);
+        if (analysisComplete.current) return;
+
+        console.warn('Challenge error:', error);
+        submitAnalysis({
+          ...browserData,
+          jsChallenge: { valid: false, error: error.message },
+        });
       });
 
     // Only report visit in production
@@ -740,9 +774,30 @@ export default function App() {
       <h2>Browser Fingerprint - Bot Detection POC</h2>
 
       {/* Bot Analysis Results */}
-      {botAnalysis && (
-        <div className="bot-analysis-section">
-          <h3>Bot Detection Analysis</h3>
+      <div className="bot-analysis-section">
+        <h3>Bot Detection Analysis</h3>
+        {!botAnalysis ? (
+          <div className="verdict-card verdict-loading" style={{ borderColor: '#6b7280' }}>
+            <div className="verdict-header">
+              <span className="verdict-badge" style={{ backgroundColor: '#6b7280' }}>
+                {analysisStatus === 'collecting' && 'COLLECTING...'}
+                {analysisStatus === 'challenging' && 'VERIFYING JS...'}
+                {analysisStatus === 'analyzing' && 'ANALYZING...'}
+              </span>
+            </div>
+            <div className="analysis-progress">
+              <div className="progress-step" data-done={analysisStatus !== 'collecting'}>
+                Collect browser data
+              </div>
+              <div className="progress-step" data-done={analysisStatus === 'analyzing' || analysisStatus === 'complete'}>
+                Complete JS challenge
+              </div>
+              <div className="progress-step" data-done={analysisStatus === 'complete'}>
+                Analyze signals
+              </div>
+            </div>
+          </div>
+        ) : (
           <div className="verdict-card" style={{ borderColor: getVerdictColor(botAnalysis.verdict) }}>
             <div className="verdict-header">
               <span
@@ -775,31 +830,33 @@ export default function App() {
               <span className="passed">Passed: {botAnalysis.summary.passed}</span>
             </div>
           </div>
+        )}
 
-          {botAnalysis.signals.length > 0 && (
-            <div className="signals-section">
-              <h4>Flagged Signals</h4>
-              <table className="signals-table">
-                <thead>
-                  <tr>
-                    <th>Signal</th>
-                    <th>Weight</th>
-                    <th>Reason</th>
+        {botAnalysis && botAnalysis.signals.length > 0 && (
+          <div className="signals-section">
+            <h4>Flagged Signals</h4>
+            <table className="signals-table">
+              <thead>
+                <tr>
+                  <th>Signal</th>
+                  <th>Weight</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {botAnalysis.signals.map((signal) => (
+                  <tr key={signal.name} className="signal-flagged">
+                    <td>{signal.name}</td>
+                    <td>+{signal.weight}</td>
+                    <td>{signal.reason}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {botAnalysis.signals.map((signal) => (
-                    <tr key={signal.name} className="signal-flagged">
-                      <td>{signal.name}</td>
-                      <td>+{signal.weight}</td>
-                      <td>{signal.reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
+        {botAnalysis && (
           <details className="all-signals-details">
             <summary>View All Signals ({botAnalysis.allSignals.length})</summary>
             <table className="signals-table">
@@ -821,8 +878,8 @@ export default function App() {
               </tbody>
             </table>
           </details>
-        </div>
-      )}
+        )}
+      </div>
 
       {renderSection('Screen', browserData?.screen)}
       {renderSection('Window', browserData?.window)}

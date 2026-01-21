@@ -139,30 +139,91 @@ const analyzeHeadersOnly = (headers) => {
 };
 
 // Track page visits to detect clients that fetch HTML but never execute JS
-const pageVisits = new Map(); // ip -> { timestamp, completed: boolean, botApiCalled: boolean }
-const VISIT_TTL = 30000; // 30 seconds to complete JS challenge
+const pageVisits = new Map(); // ip -> { timestamp, completed: boolean, botApiCalled: boolean, timeoutId: NodeJS.Timeout }
+const VISIT_TTL = 5000; // 5 seconds to complete JS challenge
+
+const deliverBotVerdict = (ip, reason) => {
+  const visit = pageVisits.get(ip);
+  if (!visit || visit.completed) return; // Already completed or cleaned up
+
+  console.log('[bot-verdict]', JSON.stringify({
+    timestamp: new Date().toISOString(),
+    ip,
+    verdict: 'bot',
+    score: 100,
+    code: 1006,
+    reason,
+    botApiCalled: visit.botApiCalled,
+    challengeCompleted: visit.completed,
+  }));
+
+  // Mark as completed so we don't deliver again
+  visit.completed = true;
+  visit.finalVerdict = {
+    verdict: 'bot',
+    score: 100,
+    maxScore: 100,
+    code: 1006,
+    confidence: 'high',
+    reason,
+    signals: [{
+      name: 'noJsExecution',
+      detected: true,
+      weight: 100,
+      reason,
+      category: 'automation',
+    }],
+    allSignals: [{
+      name: 'noJsExecution',
+      detected: true,
+      weight: 100,
+      reason,
+      category: 'automation',
+    }],
+    signalsByCategory: {
+      automation: [{
+        name: 'noJsExecution',
+        detected: true,
+        weight: 100,
+        reason,
+        category: 'automation',
+      }],
+    },
+    summary: {
+      totalChecks: 1,
+      flagged: 1,
+      passed: 0,
+    },
+  };
+};
 
 const trackPageVisit = (ip) => {
-  pageVisits.set(ip, { timestamp: Date.now(), completed: false, botApiCalled: false });
+  // Clear any existing timeout for this IP
+  const existingVisit = pageVisits.get(ip);
+  if (existingVisit?.timeoutId) {
+    clearTimeout(existingVisit.timeoutId);
+  }
 
-  // Clean up old entries
+  // Set up timeout to deliver bot verdict if /api/bot is never called
+  const timeoutId = setTimeout(() => {
+    const visit = pageVisits.get(ip);
+    if (visit && !visit.botApiCalled) {
+      deliverBotVerdict(ip, 'Fetched page but never called /api/bot within 5 seconds (no JS execution)');
+    }
+  }, VISIT_TTL);
+
+  pageVisits.set(ip, {
+    timestamp: Date.now(),
+    completed: false,
+    botApiCalled: false,
+    timeoutId,
+    finalVerdict: null,
+  });
+
+  // Clean up old entries (entries older than 60 seconds)
   for (const [visitIp, visit] of pageVisits.entries()) {
-    if (Date.now() - visit.timestamp > VISIT_TTL) {
-      // Log incomplete visits as bots
-      if (!visit.completed || !visit.botApiCalled) {
-        const reason = !visit.botApiCalled
-          ? 'Fetched page but never called /api/bot (no JS execution)'
-          : 'Fetched page but JS challenge not completed';
-        console.log('[incomplete-visit]', JSON.stringify({
-          timestamp: new Date().toISOString(),
-          ip: visitIp,
-          verdict: 'bot',
-          code: 1006,
-          reason,
-          botApiCalled: visit.botApiCalled,
-          challengeCompleted: visit.completed,
-        }));
-      }
+    if (Date.now() - visit.timestamp > 60000) {
+      if (visit.timeoutId) clearTimeout(visit.timeoutId);
       pageVisits.delete(visitIp);
     }
   }
@@ -172,6 +233,11 @@ const markBotApiCalled = (ip) => {
   const visit = pageVisits.get(ip);
   if (visit) {
     visit.botApiCalled = true;
+    // Clear the timeout since they called the API
+    if (visit.timeoutId) {
+      clearTimeout(visit.timeoutId);
+      visit.timeoutId = null;
+    }
   }
 };
 
@@ -187,6 +253,11 @@ const getVisitVerdict = (ip) => {
   const visit = pageVisits.get(ip);
   if (!visit) {
     return { verdict: 'unknown', reason: 'No visit tracked for this IP' };
+  }
+
+  // If we already delivered a final verdict, return it
+  if (visit.finalVerdict) {
+    return visit.finalVerdict;
   }
 
   const elapsed = Date.now() - visit.timestamp;
