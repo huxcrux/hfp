@@ -138,6 +138,73 @@ const analyzeHeadersOnly = (headers) => {
   };
 };
 
+// Track page visits to detect clients that fetch HTML but never execute JS
+const pageVisits = new Map(); // ip -> { timestamp, completed: boolean, botApiCalled: boolean }
+const VISIT_TTL = 30000; // 30 seconds to complete JS challenge
+
+const trackPageVisit = (ip) => {
+  pageVisits.set(ip, { timestamp: Date.now(), completed: false, botApiCalled: false });
+
+  // Clean up old entries
+  for (const [visitIp, visit] of pageVisits.entries()) {
+    if (Date.now() - visit.timestamp > VISIT_TTL) {
+      // Log incomplete visits as bots
+      if (!visit.completed || !visit.botApiCalled) {
+        const reason = !visit.botApiCalled
+          ? 'Fetched page but never called /api/bot (no JS execution)'
+          : 'Fetched page but JS challenge not completed';
+        console.log('[incomplete-visit]', JSON.stringify({
+          timestamp: new Date().toISOString(),
+          ip: visitIp,
+          verdict: 'bot',
+          code: 1006,
+          reason,
+          botApiCalled: visit.botApiCalled,
+          challengeCompleted: visit.completed,
+        }));
+      }
+      pageVisits.delete(visitIp);
+    }
+  }
+};
+
+const markBotApiCalled = (ip) => {
+  const visit = pageVisits.get(ip);
+  if (visit) {
+    visit.botApiCalled = true;
+  }
+};
+
+const markVisitComplete = (ip) => {
+  const visit = pageVisits.get(ip);
+  if (visit) {
+    visit.completed = true;
+  }
+};
+
+// Get verdict for a visit - returns bot if /api/bot was never called
+const getVisitVerdict = (ip) => {
+  const visit = pageVisits.get(ip);
+  if (!visit) {
+    return { verdict: 'unknown', reason: 'No visit tracked for this IP' };
+  }
+
+  const elapsed = Date.now() - visit.timestamp;
+
+  if (visit.completed && visit.botApiCalled) {
+    return { verdict: 'pending-analysis', reason: 'Visit complete, awaiting full analysis' };
+  }
+
+  if (!visit.botApiCalled) {
+    if (elapsed > VISIT_TTL) {
+      return { verdict: 'bot', code: 1006, reason: 'Never called /api/bot - no JS execution' };
+    }
+    return { verdict: 'pending', reason: `Waiting for /api/bot call (${Math.round((VISIT_TTL - elapsed) / 1000)}s remaining)` };
+  }
+
+  return { verdict: 'pending', reason: 'Bot API called, awaiting completion' };
+};
+
 const logVisit = ({ req, browserData = null, note = 'n/a' }) => {
   const ip = getClientIp(req);
   const timestamp = new Date().toISOString();
@@ -250,8 +317,28 @@ app.use((req, _res, next) => {
   // Skip static assets and API calls that will have their own logging
   const isStaticAsset = path.extname(req.path) && !req.path.endsWith('.html');
   const isBotApiCall = req.path === '/api/bot';
+  const isApiCall = req.path.startsWith('/api/');
 
-  if (!isStaticAsset && !isBotApiCall) {
+  // Track page visits (HTML document requests)
+  const isDocumentRequest = req.method === 'GET' &&
+    !isStaticAsset &&
+    !isApiCall &&
+    (req.headers['sec-fetch-dest'] === 'document' || req.headers['accept']?.includes('text/html'));
+
+  if (isDocumentRequest) {
+    trackPageVisit(getClientIp(req));
+
+    // For document requests, headers alone cannot prove human - needs JS execution
+    console.log('[header-analysis]', JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ip: getClientIp(req),
+      method: req.method,
+      path: req.path,
+      verdict: 'pending',
+      note: 'Awaiting JS challenge completion - headers alone cannot verify human',
+      userAgent: req.headers['user-agent'] || 'none',
+    }));
+  } else if (!isStaticAsset && !isBotApiCall) {
     const analysis = analyzeHeadersOnly(req.headers);
 
     console.log('[header-analysis]', JSON.stringify({
@@ -919,15 +1006,94 @@ const analyzeBotSignals = (browserData, headers) => {
   };
 };
 
+// Endpoint to check visit status - useful for debugging and monitoring
+app.get('/api/visit-status', (req, res) => {
+  const ip = getClientIp(req);
+  const verdict = getVisitVerdict(ip);
+
+  console.log('[visit-status]', JSON.stringify({
+    timestamp: new Date().toISOString(),
+    ip,
+    ...verdict,
+  }));
+
+  res.json(verdict);
+});
+
 app.post('/api/bot', (req, res) => {
   const browserData = req.body ?? {};
   const headers = req.headers;
+  const ip = getClientIp(req);
+
+  // Mark that this IP called the bot API (proves some JS execution)
+  markBotApiCalled(ip);
+
+  // Early rejection: No JS execution capability = definite bot
+  const hasEssentialData = browserData?.screen?.width > 0 &&
+                           browserData?.navigator?.userAgent &&
+                           browserData?.window;
+  const hasJsChallenge = browserData?.jsChallenge?.valid === true;
+
+  if (!hasEssentialData || !hasJsChallenge) {
+    const reason = !hasEssentialData
+      ? 'Missing essential browser data (no JS execution)'
+      : 'JS challenge not completed or failed';
+
+    console.log('[bot-analysis]', JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ip,
+      verdict: 'bot',
+      score: 100,
+      code: 1005,
+      reason,
+    }));
+
+    return res.json({
+      verdict: 'bot',
+      score: 100,
+      maxScore: 100,
+      code: 1005,
+      confidence: 'high',
+      reason,
+      signals: [{
+        name: 'jsExecutionFailed',
+        detected: true,
+        weight: 100,
+        reason,
+        category: 'automation',
+      }],
+      allSignals: [{
+        name: 'jsExecutionFailed',
+        detected: true,
+        weight: 100,
+        reason,
+        category: 'automation',
+      }],
+      signalsByCategory: {
+        automation: [{
+          name: 'jsExecutionFailed',
+          detected: true,
+          weight: 100,
+          reason,
+          category: 'automation',
+        }],
+      },
+      summary: {
+        totalChecks: 1,
+        flagged: 1,
+        passed: 0,
+      },
+    });
+  }
 
   const analysis = analyzeBotSignals(browserData, headers);
 
+  // Mark visit as complete (JS executed successfully)
+  markVisitComplete(ip);
+
   console.log('[bot-analysis]', JSON.stringify({
     timestamp: new Date().toISOString(),
-    ip: getClientIp(req),
+    ip,
     verdict: analysis.verdict,
     score: analysis.score,
     flaggedSignals: analysis.signals.map(s => s.name),
