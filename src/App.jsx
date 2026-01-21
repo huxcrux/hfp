@@ -765,13 +765,40 @@ export default function App() {
     }
   };
 
+  // Parallax star layers component
+  const ParallaxStars = () => (
+    <div className="parallax-stars">
+      <div className="stars-layer stars-layer-1" />
+      <div className="stars-layer stars-layer-2" />
+      <div className="stars-layer stars-layer-3" />
+      <div className="stars-layer stars-layer-4" />
+      <div className="stars-layer stars-layer-5" />
+      <div className="stars-layer stars-layer-6" />
+    </div>
+  );
+
   if (loading) {
-    return <div className="fingerprint-container">Collecting browser data...</div>;
+    return (
+      <>
+        <ParallaxStars />
+        <div className="fingerprint-container">Collecting browser data...</div>
+      </>
+    );
   }
 
+  const titleText = "Browser Fingerprint - Bot Detection POC";
+
   return (
-    <div className="fingerprint-container">
-      <h2>Browser Fingerprint - Bot Detection POC</h2>
+    <>
+      <ParallaxStars />
+      <div className="fingerprint-container">
+        <h2 className="rainbow-title">
+        {titleText.split('').map((char, i) => (
+          <span key={i} style={{ animationDelay: `${i * 0.05}s` }}>
+            {char === ' ' ? '\u00A0' : char}
+          </span>
+        ))}
+      </h2>
 
       {/* Bot Analysis Results */}
       <div className="bot-analysis-section">
@@ -929,5 +956,6 @@ export default function App() {
         <p>{browserData?.fonts?.join(', ') || 'None detected'}</p>
       </div>
     </div>
+    </>
   );
 }
