@@ -1,6 +1,6 @@
-# Baffin Bay Fingerprint (skeleton)
+# Fingerprinting
 
-This is a skeleton for the baffinbay fingerprint hackathon during the 2026 off-site
+This is a skeleton for the fingerprint hackathon
 
 
 
